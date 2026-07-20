@@ -2,14 +2,50 @@ import { Platform, StyleSheet, Text, type TextProps } from 'react-native';
 
 import { Fonts, ThemeColor } from '@/constants/theme';
 import { useTheme } from '@/hooks/use-theme';
+import { a11y } from '@/lib/accessibility';
 
 export type ThemedTextProps = TextProps & {
   type?: 'default' | 'title' | 'small' | 'smallBold' | 'subtitle' | 'link' | 'linkPrimary' | 'code';
   themeColor?: ThemeColor;
+  // Accessibility overrides (semantic role for screen readers)
+  semanticRole?: 'header' | 'text' | 'link';
+  semanticHeaderLevel?: 1 | 2 | 3;
+  accessibilityLabel?: string;
+  // Allow font scaling to honor user Dynamic Type settings (default true)
+  allowFontScaling?: boolean;
+  // Set maxFontSizeMultiplier to clamp extreme sizes
+  maxFontSizeMultiplier?: number;
 };
 
-export function ThemedText({ style, type = 'default', themeColor, ...rest }: ThemedTextProps) {
+export function ThemedText({
+  style,
+  type = 'default',
+  themeColor,
+  semanticRole,
+  semanticHeaderLevel,
+  accessibilityLabel,
+  allowFontScaling = true,
+  maxFontSizeMultiplier = 1.8,
+  ...rest
+}: ThemedTextProps) {
   const theme = useTheme();
+
+  // Pick the right role for the chosen type so screen readers announce
+  // headings as headings, links as links, etc.
+  const inferredRole: 'header' | 'text' | 'link' | undefined =
+    semanticRole ??
+    (type === 'title' || type === 'subtitle'
+      ? 'header'
+      : type === 'link' || type === 'linkPrimary'
+        ? 'link'
+        : undefined);
+
+  const a11yProps: TextProps =
+    inferredRole === 'header'
+      ? (a11y.header(semanticHeaderLevel ?? (type === 'title' ? 1 : 2), accessibilityLabel) as TextProps)
+      : inferredRole === 'link'
+        ? (a11y.link(accessibilityLabel ?? '', { hint: 'Opens link' }) as TextProps)
+        : {};
 
   return (
     <Text
@@ -25,49 +61,54 @@ export function ThemedText({ style, type = 'default', themeColor, ...rest }: The
         type === 'code' && styles.code,
         style,
       ]}
+      allowFontScaling={allowFontScaling}
+      maxFontSizeMultiplier={maxFontSizeMultiplier}
+      // iOS-only: prevent system from truncating at fixed width
+      adjustsFontSizeToFit={type === 'title' || type === 'subtitle'}
+      numberOfLines={type === 'title' ? 2 : undefined}
+      {...a11yProps}
       {...rest}
     />
   );
 }
 
 const styles = StyleSheet.create({
-  small: {
-    fontSize: 14,
-    lineHeight: 20,
-    fontWeight: 500,
-  },
-  smallBold: {
-    fontSize: 14,
-    lineHeight: 20,
-    fontWeight: 700,
-  },
   default: {
     fontSize: 16,
     lineHeight: 24,
-    fontWeight: 500,
   },
   title: {
-    fontSize: 48,
-    fontWeight: 600,
-    lineHeight: 52,
+    fontSize: 28,
+    lineHeight: 34,
+    fontWeight: '700',
   },
   subtitle: {
-    fontSize: 32,
-    lineHeight: 44,
-    fontWeight: 600,
+    fontSize: 20,
+    fontWeight: '600',
+  },
+  small: {
+    fontSize: 13,
+    lineHeight: 18,
+  },
+  smallBold: {
+    fontSize: 13,
+    lineHeight: 18,
+    fontWeight: '600',
   },
   link: {
-    lineHeight: 30,
-    fontSize: 14,
+    fontSize: 16,
+    lineHeight: 24,
+    color: Platform.select({ ios: '#208AEF', default: '#208AEF' }),
+    textDecorationLine: 'underline',
   },
   linkPrimary: {
-    lineHeight: 30,
-    fontSize: 14,
-    color: '#3c87f7',
+    fontSize: 16,
+    lineHeight: 24,
+    fontWeight: '600',
+    color: '#208AEF',
   },
   code: {
-    fontFamily: Fonts.mono,
-    fontWeight: Platform.select({ android: 700 }) ?? 500,
-    fontSize: 12,
+    fontFamily: Platform.select({ ios: 'Menlo', default: 'monospace' }),
+    fontSize: 14,
   },
 });

@@ -7,10 +7,30 @@ export type ThemedViewProps = ViewProps & {
   lightColor?: string;
   darkColor?: string;
   type?: ThemeColor;
+  // When true, the view is announced as a single unit by screen readers
+  // (children's individual labels are merged into one announcement)
+  accessibleGroup?: boolean;
+  accessibilityLabel?: string;
 };
 
-export function ThemedView({ style, lightColor, darkColor, type, ...otherProps }: ThemedViewProps) {
+export function ThemedView({
+  style,
+  lightColor,
+  darkColor,
+  type,
+  accessibleGroup,
+  accessibilityLabel,
+  accessible,
+  ...otherProps
+}: ThemedViewProps) {
   const theme = useTheme();
 
-  return <View style={[{ backgroundColor: theme[type ?? 'background'] }, style]} {...otherProps} />;
+  return (
+    <View
+      accessible={accessibleGroup ? true : accessible}
+      accessibilityLabel={accessibleGroup ? accessibilityLabel : undefined}
+      style={[{ backgroundColor: theme[type ?? 'background'] }, style]}
+      {...otherProps}
+    />
+  );
 }

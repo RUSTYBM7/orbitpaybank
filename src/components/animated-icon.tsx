@@ -95,9 +95,28 @@ const glowKeyframe = new Keyframe({
   },
 });
 
-export function AnimatedIcon() {
+export function AnimatedIcon({ reduceMotion = false }: { reduceMotion?: boolean }) {
+  // When Reduce Motion is on, swap the keyframe animations for static views
+  if (reduceMotion) {
+    return (
+      <View
+        style={styles.iconContainer}
+        accessibilityElementsHidden
+        importantForAccessibility="no"
+      >
+        <View style={styles.background} />
+        <View style={styles.imageContainer}>
+          <Image style={styles.image} source={require('@/assets/images/expo-logo.png')} />
+        </View>
+      </View>
+    );
+  }
   return (
-    <View style={styles.iconContainer}>
+    <View
+      style={styles.iconContainer}
+      accessibilityElementsHidden
+      importantForAccessibility="no"
+    >
       <Animated.View entering={glowKeyframe.duration(60 * 1000 * 4)} style={styles.glow}>
         <Image style={styles.glow} source={require('@/assets/images/logo-glow.png')} />
       </Animated.View>

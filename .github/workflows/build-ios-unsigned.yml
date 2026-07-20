@@ -1,27 +1,17 @@
-name: Build iOS (unsigned) — macOS runner
+name: Build + sign iOS — macOS runner
 
-# Produces an unsigned iOS build (Xcode archive, .app, .ipa, dSYM, source map,
-# logs, and metadata) on a macOS runner. The user signs the artifacts themselves.
-#
-# Why macOS-only: iOS apps can only be compiled with Xcode (xcodebuild), which
-# only runs on macOS. Linux / Windows runners cannot produce iOS artifacts.
+# Produces a SIGNED iOS .ipa (using the repo's APPLE_P12 + APPLE_MOBILEPROVISION
+# secrets) and uploads the signed .ipa + .app + .xcarchive + dSYM + JS bundle
+# + logs + manifest. Runs on macos-latest — no Apple Developer Portal login
+# required at runtime.
 #
 # Triggers:
-#   - workflow_dispatch (manual)
+#   - workflow_dispatch (manual, with configuration + ipa toggle)
 #   - push to main when ios/ or app/ changes
-#
-# No Apple Developer account is required for the BUILD step. The user will
-# perform `codesign` / `xcodebuild -exportArchive` themselves with their own
-# signing certificate and provisioning profile.
 
 on:
   workflow_dispatch:
     inputs:
-      bundle_id:
-        description: 'Bundle identifier (default from app.json)'
-        required: false
-        type: string
-        default: ''
       configuration:
         description: 'Build configuration'
         required: true
@@ -30,8 +20,8 @@ on:
         options:
           - Debug
           - Release
-      package_as_ipa:
-        description: 'Also produce an unsigned .ipa'
+      sign:
+        description: 'Sign the build'
         required: true
         type: choice
         default: 'true'
@@ -53,19 +43,21 @@ concurrency:
 
 jobs:
   build-ios:
-    name: Build unsigned iOS artifacts
+    name: Build + sign iOS
     runs-on: macos-latest
     timeout-minutes: 90
     env:
-      BUNDLE_ID: ${{ github.event.inputs.bundle_id || 'com.rustybm.orbitpaybank' }}
-      CONFIGURATION: ${{ github.event.inputs.configuration || 'Release' }}
-      PACKAGE_IPA: ${{ github.event.inputs.package_as_ipa || 'true' }}
       SCHEME: orbitpaybank
+      CONFIGURATION: ${{ github.event.inputs.configuration || 'Release' }}
+      SHOULD_SIGN: ${{ github.event.inputs.sign || 'true' }}
+      BUNDLE_ID: Q6SJUT5K5D.com.xl.MyXL.Giant-staging
       WORKSPACE: ios/orbitpaybank.xcworkspace
       PROJECT: ios/orbitpaybank.xcodeproj
       ARCHIVE_PATH: build/orbitpaybank.xcarchive
       EXPORT_PATH: build/export
       ARTIFACTS_DIR: build/artifacts
+      KEYCHAIN_NAME: orbitpay-build.keychain
+      KEYCHAIN_PASSWORD: orbitpay-temporary-keychain-pw
 
     steps:
       - name: Checkout
@@ -96,9 +88,17 @@ jobs:
           sudo gem install cocoapods --no-document
           pod --version
 
-      - name: Run expo prebuild (idempotent — regenerates ios/ if missing)
+      - name: Run expo prebuild (idempotent)
         run: npx expo prebuild --platform ios --no-install --clean
-        continue-on-error: false
+
+      - name: Restore bundle ID to match provisioning profile
+        run: |
+          # expo prebuild may overwrite the bundle ID in the Xcode project.
+          # Re-apply the one matching the .mobileprovision.
+          /usr/libexec/PlistBuddy -c "Print :CFBundleIdentifier" ios/orbitpaybank/Info.plist 2>/dev/null || true
+          # Force the bundle ID in the .pbxproj
+          sed -i '' "s|PRODUCT_BUNDLE_IDENTIFIER = .*|PRODUCT_BUNDLE_IDENTIFIER = ${BUNDLE_ID};|g" ios/orbitpaybank.xcodeproj/project.pbxproj
+          grep -c "$BUNDLE_ID" ios/orbitpaybank.xcodeproj/project.pbxproj && echo "bundle id patched"
 
       - name: Run pod install
         working-directory: ios
@@ -124,31 +124,152 @@ jobs:
             --assets-dest build/jsbundle/assets \
             --sourcemap-output build/jsbundle/main.jsbundle.map
 
-      - name: Build (unsigned, any device + simulator slices)
+      - name: Decode signing assets from secrets
+        if: env.SHOULD_SIGN == 'true'
+        run: |
+          mkdir -p ~/Library/MobileDevice/Provisioning\ Profiles
+          # .p12
+          echo "${{ secrets.APPLE_P12_BASE64 }}" | base64 --decode > /tmp/cert.p12
+          # .mobileprovision
+          echo "${{ secrets.APPLE_MOBILEPROVISION_BASE64 }}" | base64 --decode > ~/Library/MobileDevice/Provisioning\ Profiles/Q6SJUT5K5D.mobileprovision
+          # verify
+          ls -la /tmp/cert.p12 ~/Library/MobileDevice/Provisioning\ Profiles/
+
+      - name: Set up temporary keychain + import cert
+        if: env.SHOULD_SIGN == 'true'
+        run: |
+          # Create a fresh keychain so we don't pollute the runner's default
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_NAME"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN_NAME"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_NAME"
+          # Make it the default for this build so codesign finds the identity
+          security list-keychains -d user -s "$KEYCHAIN_NAME" $(security list-keychains -d user | tr -d '"')
+          # Import the .p12
+          security import /tmp/cert.p12 \
+            -k "$KEYCHAIN_NAME" \
+            -P "${{ secrets.APPLE_P12_PASSWORD }}" \
+            -T /usr/bin/codesign \
+            -T /usr/bin/security
+          # Verify the identity is now visible
+          security find-identity -v -p codesigning "$KEYCHAIN_NAME"
+
+      - name: Archive (unsigned or signed)
         run: |
           set -o pipefail
-          xcodebuild \
-            -workspace "$WORKSPACE" \
-            -scheme "$SCHEME" \
-            -configuration "$CONFIGURATION" \
-            -sdk iphoneos \
-            -destination 'generic/platform=iOS' \
-            -derivedDataPath build/DerivedData \
-            -archivePath "$ARCHIVE_PATH" \
-            CODE_SIGNING_ALLOWED=NO \
-            CODE_SIGNING_REQUIRED=NO \
-            CODE_SIGN_IDENTITY="" \
-            CODE_SIGNING_ENTITLEMENTS="" \
-            DEVELOPMENT_TEAM="" \
-            PROVISIONING_PROFILE_SPECIFIER="" \
-            ENABLE_BITCODE=NO \
-            DEBUG_INFORMATION_FORMAT=dwarf-with-dsym \
-            ONLY_ACTIVE_ARCH=NO \
-            build | tee build/xcodebuild-build.log
+          if [ "$SHOULD_SIGN" = "true" ]; then
+            xcodebuild \
+              -workspace "$WORKSPACE" \
+              -scheme "$SCHEME" \
+              -configuration "$CONFIGURATION" \
+              -sdk iphoneos \
+              -destination 'generic/platform=iOS' \
+              -derivedDataPath build/DerivedData \
+              -archivePath "$ARCHIVE_PATH" \
+              CODE_SIGN_IDENTITY="Apple Distribution" \
+              CODE_SIGN_STYLE=Manual \
+              PROVISIONING_PROFILE_SPECIFIER="MyXL-UniversalDist" \
+              DEVELOPMENT_TEAM=Q6SJUT5K5D \
+              DEBUG_INFORMATION_FORMAT=dwarf-with-dsym \
+              archive | tee build/xcodebuild-archive.log
+          else
+            xcodebuild \
+              -workspace "$WORKSPACE" \
+              -scheme "$SCHEME" \
+              -configuration "$CONFIGURATION" \
+              -sdk iphoneos \
+              -destination 'generic/platform=iOS' \
+              -derivedDataPath build/DerivedData \
+              -archivePath "$ARCHIVE_PATH" \
+              CODE_SIGNING_ALLOWED=NO \
+              CODE_SIGNING_REQUIRED=NO \
+              CODE_SIGN_IDENTITY="" \
+              DEBUG_INFORMATION_FORMAT=dwarf-with-dsym \
+              archive | tee build/xcodebuild-archive.log
+          fi
         env:
           RCT_NO_LAUNCH_PACKAGER: '1'
 
-      - name: Build for simulator (so users can also run in iOS Simulator)
+      - name: Build (for .app + dSYM)
+        run: |
+          set -o pipefail
+          if [ "$SHOULD_SIGN" = "true" ]; then
+            xcodebuild \
+              -workspace "$WORKSPACE" \
+              -scheme "$SCHEME" \
+              -configuration "$CONFIGURATION" \
+              -sdk iphoneos \
+              -destination 'generic/platform=iOS' \
+              -derivedDataPath build/DerivedData \
+              CODE_SIGN_IDENTITY="Apple Distribution" \
+              CODE_SIGN_STYLE=Manual \
+              PROVISIONING_PROFILE_SPECIFIER="MyXL-UniversalDist" \
+              DEVELOPMENT_TEAM=Q6SJUT5K5D \
+              DEBUG_INFORMATION_FORMAT=dwarf-with-dsym \
+              ONLY_ACTIVE_ARCH=NO \
+              build | tee build/xcodebuild-build.log
+          else
+            xcodebuild \
+              -workspace "$WORKSPACE" \
+              -scheme "$SCHEME" \
+              -configuration "$CONFIGURATION" \
+              -sdk iphoneos \
+              -destination 'generic/platform=iOS' \
+              -derivedDataPath build/DerivedData \
+              CODE_SIGNING_ALLOWED=NO \
+              CODE_SIGN_IDENTITY="" \
+              ONLY_ACTIVE_ARCH=NO \
+              build | tee build/xcodebuild-build.log
+          fi
+        env:
+          RCT_NO_LAUNCH_PACKAGER: '1'
+
+      - name: Locate the .app bundle
+        id: locate-app
+        run: |
+          APP_PATH=$(find build/DerivedData -name "*.app" -path "*${CONFIGURATION}-iphoneos*" -print -quit)
+          if [ -z "$APP_PATH" ]; then
+            echo "ERROR: no .app found"
+            find build/DerivedData -name "*.app" -type d | head -10
+            exit 1
+          fi
+          echo "app_path=$APP_PATH" >> "$GITHUB_OUTPUT"
+          echo "Found .app at: $APP_PATH"
+
+      - name: Verify code signature
+        if: env.SHOULD_SIGN == 'true'
+        run: |
+          APP_PATH="${{ steps.locate-app.outputs.app_path }}"
+          codesign -dv --verbose=2 "$APP_PATH" 2>&1 | head -20
+          echo "---"
+          codesign --verify --verbose=2 "$APP_PATH" 2>&1
+
+      - name: Package signed .ipa (via xcodebuild -exportArchive)
+        if: env.SHOULD_SIGN == 'true'
+        run: |
+          set -o pipefail
+          mkdir -p "$EXPORT_PATH"
+          xcodebuild \
+            -exportArchive \
+            -archivePath "$ARCHIVE_PATH" \
+            -exportPath "$EXPORT_PATH" \
+            -exportOptionsPlist ios/ExportOptions.plist
+          ls -lh "$EXPORT_PATH"
+
+      - name: Package .ipa (Payload/.app zip, fallback if exportArchive fails)
+        run: |
+          set -e
+          APP_PATH="${{ steps.locate-app.outputs.app_path }}"
+          if [ ! -f "$EXPORT_PATH/orbitpaybank.ipa" ]; then
+            echo "exportArchive didn't produce .ipa, falling back to Payload zip"
+            mkdir -p build/Payload
+            cp -R "$APP_PATH" build/Payload/
+            (cd build && /usr/bin/zip -r orbitpaybank.ipa Payload >/dev/null)
+            mkdir -p "$EXPORT_PATH"
+            cp build/orbitpaybank.ipa "$EXPORT_PATH/orbitpaybank.ipa"
+          fi
+          ls -lh "$EXPORT_PATH"
+
+      - name: Build for simulator (so .app also runs in Simulator)
         run: |
           set -o pipefail
           xcodebuild \
@@ -159,73 +280,8 @@ jobs:
             -destination 'generic/platform=iOS Simulator' \
             -derivedDataPath build/DerivedData \
             CODE_SIGNING_ALLOWED=NO \
-            CODE_SIGNING_REQUIRED=NO \
             CODE_SIGN_IDENTITY="" \
             build | tee build/xcodebuild-simulator.log
-
-      - name: Create .xcarchive (unsigned)
-        run: |
-          set -o pipefail
-          xcodebuild \
-            -workspace "$WORKSPACE" \
-            -scheme "$SCHEME" \
-            -configuration "$CONFIGURATION" \
-            -sdk iphoneos \
-            -destination 'generic/platform=iOS' \
-            -derivedDataPath build/DerivedData \
-            -archivePath "$ARCHIVE_PATH" \
-            CODE_SIGNING_ALLOWED=NO \
-            CODE_SIGNING_REQUIRED=NO \
-            CODE_SIGN_IDENTITY="" \
-            DEBUG_INFORMATION_FORMAT=dwarf-with-dsym \
-            archive | tee build/xcodebuild-archive.log
-        env:
-          RCT_NO_LAUNCH_PACKAGER: '1'
-
-      - name: Locate the .app bundle
-        id: locate-app
-        run: |
-          APP_PATH=$(find build/DerivedData -name "*.app" -path "*Release-iphoneos*" -print -quit)
-          if [ -z "$APP_PATH" ]; then
-            echo "ERROR: no .app found in build/DerivedData"
-            find build/DerivedData -name "*.app" -type d | head -10
-            exit 1
-          fi
-          echo "app_path=$APP_PATH" >> "$GITHUB_OUTPUT"
-          echo "Found .app at: $APP_PATH"
-
-      - name: Generate ExportOptions.plist (unsigned)
-        run: |
-          cat > ios/ExportOptions.plist <<'PLIST'
-          <?xml version="1.0" encoding="UTF-8"?>
-          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-          <plist version="1.0">
-          <dict>
-            <key>method</key>
-            <string>development</string>
-            <key>signingStyle</key>
-            <string>manual</string>
-            <key>compileBitcode</key>
-            <false/>
-            <key>uploadSymbols</key>
-            <false/>
-            <key>destination</key>
-            <string>export</string>
-          </dict>
-          </plist>
-          PLIST
-          cat ios/ExportOptions.plist
-
-      - name: Package unsigned .ipa (Payload/.app)
-        if: env.PACKAGE_IPA == 'true'
-        run: |
-          set -e
-          APP_PATH="${{ steps.locate-app.outputs.app_path }}"
-          mkdir -p build/Payload
-          cp -R "$APP_PATH" build/Payload/
-          cd build
-          /usr/bin/zip -r "orbitpaybank-unsigned.ipa" Payload >/dev/null
-          ls -lh orbitpaybank-unsigned.ipa
 
       - name: Collect artifacts
         run: |
@@ -237,9 +293,9 @@ jobs:
           if [ -d "$ARCHIVE_PATH" ]; then
             cp -R "$ARCHIVE_PATH" "$ARTIFACTS_DIR/orbitpaybank.xcarchive"
           fi
-          # .ipa (if produced)
-          if [ -f build/orbitpaybank-unsigned.ipa ]; then
-            cp build/orbitpaybank-unsigned.ipa "$ARTIFACTS_DIR/"
+          # .ipa (signed or unsigned)
+          if [ -f "$EXPORT_PATH/orbitpaybank.ipa" ]; then
+            cp "$EXPORT_PATH/orbitpaybank.ipa" "$ARTIFACTS_DIR/orbitpaybank.ipa"
           fi
           # dSYM
           find build/DerivedData -name "*.dSYM" -type d -exec cp -R {} "$ARTIFACTS_DIR/" \; || true
@@ -258,11 +314,11 @@ jobs:
             "configuration": "${{ env.CONFIGURATION }}",
             "scheme": "${{ env.SCHEME }}",
             "bundle_id": "${{ env.BUNDLE_ID }}",
-            "code_signing": "disabled",
+            "signed": $([ "$SHOULD_SIGN" = "true" ] && echo true || echo false),
             "artifact_set": [
               "orbitpaybank.app",
               "orbitpaybank.xcarchive",
-              "orbitpaybank-unsigned.ipa",
+              "orbitpaybank.ipa",
               "*.dSYM",
               "jsbundle/main.jsbundle",
               "jsbundle/main.jsbundle.map",
@@ -273,24 +329,35 @@ jobs:
           JSON
           cat > "$ARTIFACTS_DIR/release-metadata.json" <<JSON
           {
-            "app_name": "orbitpaybank",
+            "app_name": "OrbitPay",
             "app_version": "$(node -p "require('./package.json').version")",
             "sdk_version": "$(node -p "require('./package.json').dependencies.expo || 'n/a'")",
             "build_date": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
             "git_sha": "${{ github.sha }}",
             "git_ref": "${{ github.ref }}",
-            "runner": "macos-latest"
+            "runner": "macos-latest",
+            "signing": {
+              "team_id": "Q6SJUT5K5D",
+              "profile_name": "MyXL-UniversalDist",
+              "entitlements": "aps-environment, associated-domains, keychain-access-groups"
+            }
           }
           JSON
           echo "===== artifact inventory ====="
-          find "$ARTIFACTS_DIR" -maxdepth 3 -type f -o -type d | head -40
+          find "$ARTIFACTS_DIR" -maxdepth 3 \( -type f -o -type d \) | head -40
           echo "===== sizes ====="
           du -sh "$ARTIFACTS_DIR"/* 2>/dev/null
+
+      - name: Clean up keychain
+        if: always() && env.SHOULD_SIGN == 'true'
+        run: |
+          security delete-keychain "$KEYCHAIN_NAME" 2>/dev/null || true
+          rm -f /tmp/cert.p12
 
       - name: Upload all artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: orbitpaybank-ios-unsigned
+          name: orbitpaybank-ios-signed
           path: build/artifacts
           if-no-files-found: error
           retention-days: 30
@@ -306,21 +373,22 @@ jobs:
           echo "| Bundle ID | ${{ env.BUNDLE_ID }} |" >> $GITHUB_STEP_SUMMARY
           echo "| Configuration | ${{ env.CONFIGURATION }} |" >> $GITHUB_STEP_SUMMARY
           echo "| Scheme | ${{ env.SCHEME }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Team ID | Q6SJUT5K5D |" >> $GITHUB_STEP_SUMMARY
+          echo "| Profile | MyXL-UniversalDist |" >> $GITHUB_STEP_SUMMARY
+          echo "| Signed | ${{ env.SHOULD_SIGN }} |" >> $GITHUB_STEP_SUMMARY
           echo "| Runner | macos-latest |" >> $GITHUB_STEP_SUMMARY
-          echo "| Code signing | DISABLED (unsigned) |" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
-          echo "### How to sign the artifacts locally" >> $GITHUB_STEP_SUMMARY
+          echo "### How to install" >> $GITHUB_STEP_SUMMARY
           echo '```bash' >> $GITHUB_STEP_SUMMARY
-          echo '# After downloading the artifact zip, extract and sign:' >> $GITHUB_STEP_SUMMARY
-          echo 'unzip orbitpaybank-ios-unsigned.zip' >> $GITHUB_STEP_SUMMARY
-          echo 'cd orbitpaybank-ios-unsigned' >> $GITHUB_STEP_SUMMARY
+          echo '# 1. Download the orbitpaybank-ios-signed artifact (zip)' >> $GITHUB_STEP_SUMMARY
+          echo 'unzip orbitpaybank-ios-signed.zip' >> $GITHUB_STEP_SUMMARY
           echo '' >> $GITHUB_STEP_SUMMARY
-          echo '# Sign the .app with your certificate' >> $GITHUB_STEP_SUMMARY
-          echo 'codesign --force --sign "Apple Development: YOUR NAME (TEAMID)" \\' >> $GITHUB_STEP_SUMMARY
-          echo '  --entitlements ios-source/orbitpaybank/orbitpaybank.entitlements \\' >> $GITHUB_STEP_SUMMARY
-          echo '  orbitpaybank.app' >> $GITHUB_STEP_SUMMARY
+          echo '# 2a. Install on a registered device (TestFlight / ad-hoc):' >> $GITHUB_STEP_SUMMARY
+          echo 'xcrun devicectl device install app orbitpaybank-ios-signed/orbitpaybank.ipa' >> $GITHUB_STEP_SUMMARY
+          echo '# OR:' >> $GITHUB_STEP_SUMMARY
+          echo 'ios-deploy --bundle orbitpaybank-ios-signed/orbitpaybank.app' >> $GITHUB_STEP_SUMMARY
           echo '' >> $GITHUB_STEP_SUMMARY
-          echo '# Re-package signed .ipa' >> $GITHUB_STEP_SUMMARY
-          echo 'rm -rf Payload && mkdir Payload && cp -R orbitpaybank.app Payload/' >> $GITHUB_STEP_SUMMARY
-          echo 'zip -r orbitpaybank-signed.ipa Payload' >> $GITHUB_STEP_SUMMARY
+          echo '# 2b. Run in iOS Simulator (unsigned simulator .app also produced):' >> $GITHUB_STEP_SUMMARY
+          echo 'xcrun simctl install booted orbitpaybank-ios-signed/orbitpaybank.app' >> $GITHUB_STEP_SUMMARY
+          echo 'xcrun simctl launch booted com.xl.MyXL.Giant-staging' >> $GITHUB_STEP_SUMMARY
           echo '```' >> $GITHUB_STEP_SUMMARY

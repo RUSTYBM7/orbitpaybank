@@ -6,13 +6,24 @@ import { ThemedText } from './themed-text';
 import { ThemedView } from './themed-view';
 
 import { Spacing } from '@/constants/theme';
+import { a11y } from '@/lib/accessibility';
 
 export function WebBadge() {
   const scheme = useColorScheme();
 
   return (
-    <ThemedView style={styles.container}>
-      <ThemedText type="code" themeColor="textSecondary" style={styles.versionText}>
+    <ThemedView
+      style={styles.container}
+      // The whole badge is decorative for screen readers — version info
+      // is already announced elsewhere
+      {...(a11y.hidden as any)}
+    >
+      <ThemedText
+        type="code"
+        themeColor="textSecondary"
+        style={styles.versionText}
+        accessibilityLabel={`Expo version ${version}`}
+      >
         v{version}
       </ThemedText>
       <Image
@@ -22,6 +33,9 @@ export function WebBadge() {
             : require('@/assets/images/expo-badge.png')
         }
         style={styles.badgeImage}
+        // Decorative — the link context already exists
+        accessibilityElementsHidden
+        importantForAccessibility="no"
       />
     </ThemedView>
   );
