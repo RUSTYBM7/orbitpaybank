@@ -81,7 +81,6 @@ jobs:
         uses: ruby/setup-ruby@v1
         with:
           ruby-version: '3.2'
-          bundler-cache: true
 
       - name: Install CocoaPods
         run: |
@@ -125,7 +124,7 @@ jobs:
             --sourcemap-output build/jsbundle/main.jsbundle.map
 
       - name: Decode signing assets from secrets
-        if: env.SHOULD_SIGN == 'true'
+        if: ${{ env.SHOULD_SIGN == 'true' }}
         run: |
           mkdir -p ~/Library/MobileDevice/Provisioning\ Profiles
           # .p12
@@ -136,7 +135,7 @@ jobs:
           ls -la /tmp/cert.p12 ~/Library/MobileDevice/Provisioning\ Profiles/
 
       - name: Set up temporary keychain + import cert
-        if: env.SHOULD_SIGN == 'true'
+        if: ${{ env.SHOULD_SIGN == 'true' }}
         run: |
           # Create a fresh keychain so we don't pollute the runner's default
           security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_NAME"
@@ -236,7 +235,7 @@ jobs:
           echo "Found .app at: $APP_PATH"
 
       - name: Verify code signature
-        if: env.SHOULD_SIGN == 'true'
+        if: ${{ env.SHOULD_SIGN == 'true' }}
         run: |
           APP_PATH="${{ steps.locate-app.outputs.app_path }}"
           codesign -dv --verbose=2 "$APP_PATH" 2>&1 | head -20
@@ -244,7 +243,7 @@ jobs:
           codesign --verify --verbose=2 "$APP_PATH" 2>&1
 
       - name: Package signed .ipa (via xcodebuild -exportArchive)
-        if: env.SHOULD_SIGN == 'true'
+        if: ${{ env.SHOULD_SIGN == 'true' }}
         run: |
           set -o pipefail
           mkdir -p "$EXPORT_PATH"
@@ -349,7 +348,7 @@ jobs:
           du -sh "$ARTIFACTS_DIR"/* 2>/dev/null
 
       - name: Clean up keychain
-        if: always() && env.SHOULD_SIGN == 'true'
+        if: ${{ always() if: always() && env.SHOULD_SIGN == 'true'if: always() && env.SHOULD_SIGN == 'true' env.SHOULD_SIGN == 'true' }}
         run: |
           security delete-keychain "$KEYCHAIN_NAME" 2>/dev/null || true
           rm -f /tmp/cert.p12
