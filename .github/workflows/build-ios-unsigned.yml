@@ -348,7 +348,7 @@ jobs:
           du -sh "$ARTIFACTS_DIR"/* 2>/dev/null
 
       - name: Clean up keychain
-        if: ${{ always() if: always() && env.SHOULD_SIGN == 'true'if: always() && env.SHOULD_SIGN == 'true' env.SHOULD_SIGN == 'true' }}
+        if: ${{ always() && env.SHOULD_SIGN == 'true' }}
         run: |
           security delete-keychain "$KEYCHAIN_NAME" 2>/dev/null || true
           rm -f /tmp/cert.p12
